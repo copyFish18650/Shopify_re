@@ -1,0 +1,41 @@
+mixed-port: 7890
+allow-lan: false
+mode: global
+log-level: info
+ipv6: false
+
+dns:
+  enable: true
+  enhanced-mode: fake-ip
+  nameserver:
+    - 8.8.8.8
+    - 1.1.1.1
+
+proxies:
+  - name: "HK-SOCKS5"
+    type: socks5
+    server: 43.161.234.90
+    port: 55247
+    username: qnFLEpCjDO
+    password: 4Mbg6IFDPj
+    udp: true
+
+  - name: "ADS-FR"
+    type: socks5
+    server: 107.151.249.31
+    port: 1106
+    username: 3ca4c7f8832a
+    password: vzpmi7scnshcw3jh7xqp
+    udp: true
+    dialer-proxy: HK-SOCKS5
+
+proxy-groups:
+  - name: "节点选择"
+    type: select
+    proxies:
+      - "ADS-FR"
+      - "HK-SOCKS5"
+      - DIRECT
+
+rules:
+  - MATCH,节点选择
