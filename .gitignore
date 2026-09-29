@@ -1,0 +1,12 @@
+local_data/
+*.before_setup_fix.bak
+_toolqd_sample.html
+__pycache__/
+venv/
+.venv/
+config.ini
+config.yaml
+clash.yaml
+*.xlsx
+error_*.png
+node_modules/

@@ -320,9 +320,11 @@ def _setup_complete(item: dict) -> bool:
     status = item.get("状态", "")
     if status not in ("成功", "success", "SUCCESS"):
         return False
-    if "失败" in notes:
-        return False
-    return "退货规则已保存" in notes and "书面政策已发布" in notes
+    completed = {part.strip() for part in notes.split("；")}
+    required = {"退货规则已保存", "书面政策已发布"}
+    if (item.get("产品CSV") or "").strip():
+        required.add("产品已导入")
+    return required.issubset(completed)
 
 
 def read_registration_data(excel_path: str):

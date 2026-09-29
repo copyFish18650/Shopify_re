@@ -1,8 +1,11 @@
 import re
+import time
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeout
+from shopify_admin import admin_store_base
+from browser_recovery import PageLoadError, browser_disconnected, page_unavailable, reload_page, retryable_browser_error, wait_for_ready
 
 
 class StoreSetup:
@@ -12,6 +15,7 @@ class StoreSetup:
         self.bot = bot
         self.page = bot.page
         self.data = bot.data
+        self._admin_base = admin_store_base(getattr(bot, "admin_url", "")) or admin_store_base(self.page.url)
 
     def _log(self, msg):
         self.bot._log(msg)
@@ -20,11 +24,9 @@ class StoreSetup:
         self.bot._sleep(short=short)
 
     def admin_base(self) -> str:
-        m = re.search(r"(https://admin\.shopify\.com/store/[^/?#]+)", self.page.url or "")
-        if m:
-            return m.group(1)
-        handle = re.sub(r"[^a-z0-9-]", "", (self.bot.shop_name or "").lower())
-        return f"https://admin.shopify.com/store/{handle}"
+        if not self._admin_base:
+            raise RuntimeError("尚未获取真实店铺后台地址，请先完成登录或注册；不会用任务名称拼接后台地址")
+        return self._admin_base
 
     POLICY_PATHS = {
         "Return and refund policy": "settings/legal/refund",
@@ -39,16 +41,99 @@ class StoreSetup:
     def _goto_admin(self, path: str, dismiss=True):
         url = self.admin_base().rstrip("/") + "/" + path.lstrip("/")
         self._log(f"打开：{url}")
+
+        def open_url():
+            response = self.page.goto(url, wait_until="commit", timeout=45000)
+            if response and response.status >= 400:
+                error_type = PageLoadError if response.status in (408, 429) or response.status >= 500 else RuntimeError
+                raise error_type("后台页面返回 HTTP {}，请检查店铺访问权限或当前环境网络".format(response.status))
+
         # 使用后台已有导航，避免每个步骤都重新加载整个 Shopify 应用。
+        previous_url = self.page.url
         link = self.page.locator(f'a[href="{urlsplit(url).path}"]:visible').first
-        if link.count():
+        clicked_link = bool(link.count())
+        if clicked_link:
             link.click(timeout=10000)
         else:
-            self.page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            open_url()
+        target = re.compile(r"^" + re.escape(url) + r"/?(?:[?#].*)?$")
+        try:
+            self.page.wait_for_url(target, wait_until="commit", timeout=20000)
+        except PlaywrightTimeout:
+            # A settings link can ignore a click immediately after a save.
+            # Only leave a settled child page whose save controls have closed;
+            # an in-flight navigation still gets the normal recovery wait.
+            returning_from_child = (
+                path.lstrip("/").startswith("settings/")
+                and admin_store_base(previous_url) == self.admin_base()
+                and urlsplit(previous_url).path.startswith(urlsplit(url).path.rstrip("/") + "/")
+            )
+            save_controls = self.page.get_by_role("button", name=re.compile(r"^(Save|Discard|保存|放弃)$", re.I))
+            if (not clicked_link or not returning_from_child or self.page.url != previous_url
+                    or any(control.is_visible() for control in save_controls.all())):
+                raise
+            self.bot._check_cancel()
+            self._log("后台导航点击后仍停留在子页面，直接打开目标地址")
+            open_url()
+            self.page.wait_for_url(target, wait_until="commit", timeout=20000)
         self._sleep()
         # 设置本身也是弹层；通用 Close/Escape 会把设置页一起关掉。
         if dismiss and not path.lstrip("/").startswith("settings"):
             self._dismiss_modals()
+
+    def _open_loaded(self, path, label, ready, timeout=120000, max_timeout=300000):
+        """Retry only navigation/readiness, before changing form values."""
+        url = self.admin_base().rstrip("/") + "/" + path.lstrip("/")
+
+        def at_target():
+            return (admin_store_base(self.page.url) == self.admin_base()
+                    and urlsplit(self.page.url).path.rstrip("/") == urlsplit(url).path.rstrip("/"))
+
+        def target_ready(wait):
+            return ready(wait) if at_target() else False
+
+        last_error = None
+        for attempt in range(3):
+            self.bot._check_cancel()
+            if attempt and at_target():
+                # Recheck immediately before reloading: it may have recovered
+                # at the end of the previous observation window.
+                try:
+                    if target_ready(200) is not False:
+                        self._log(f"{label}已恢复，取消本次刷新")
+                        return
+                except Exception as exc:
+                    if browser_disconnected(exc) or not retryable_browser_error(exc):
+                        raise
+            try:
+                if not at_target():
+                    if attempt:
+                        self._log(f"{label}等待后仍未恢复，重新打开目标地址（{attempt}/2）")
+                    self._goto_admin(path, dismiss=False)
+                elif attempt:
+                    last_error = reload_page(self.page, self._log, label, attempt)
+            except Exception as exc:
+                if browser_disconnected(exc) or not retryable_browser_error(exc):
+                    raise
+                last_error = exc
+                self._log(f"{label}导航未完成，先检查页面恢复，暂不刷新：{str(exc).splitlines()[0]}")
+            # This also runs after goto/reload throws. A navigation error is
+            # not permission to skip the wait budget and issue another request.
+            if wait_for_ready(self.page, target_ready, self._log, label, self.bot._check_cancel,
+                              timeout=timeout, max_timeout=max_timeout):
+                if last_error:
+                    self._log(f"{label}已恢复，继续当前步骤")
+                return
+        detail = str(last_error).splitlines()[0] if last_error else "页面内容尚未出现"
+        raise PageLoadError(f"{label}等待并重试 2 次后仍未加载：{self.page.url}；{detail}") from last_error
+
+    def _completed(self, step):
+        return step in self.data.get("_setup_completed", [])
+
+    def _checkpoint(self, step):
+        checkpoint = getattr(self.bot, "_checkpoint_setup", None)
+        if checkpoint:
+            checkpoint(step)
 
     def _dismiss_modals(self, allow_escape=True):
         for name in ("Skip", "Close", "Not now", "Maybe later", "Got it", "跳过"):
@@ -74,54 +159,83 @@ class StoreSetup:
     def run(self) -> dict:
         notes = []
         csv_path = (self.data.get("产品CSV") or "").strip()
+        return_rules_ok = False
+        policies_ok = False
+        products_ok = not bool(csv_path)
+        retryable = False
 
         try:
             self._dismiss_modals()
             self.bot._handle_skip_offer()
         except Exception as e:
+            if page_unavailable(e):
+                raise
             notes.append(f"关闭弹窗：{e}")
 
         try:
-            self.setup_store_profile()
+            if not self._completed("profile"):
+                self.setup_store_profile()
+                self._checkpoint("profile")
+            else:
+                self._log("店铺资料此前已完成，继续后续步骤")
             notes.append("店铺资料已核对")
         except Exception as e:
-            notes.append(f"店铺资料失败：{e}")
+            if page_unavailable(e):
+                raise
+            notes.append(f"店铺资料提示（不影响成功）：{e}")
             self._log(notes[-1])
 
         try:
-            self.setup_return_rules()
+            if not self._completed("return_rules"):
+                self.setup_return_rules()
+                self._checkpoint("return_rules")
+            else:
+                self._log("退货规则此前已完成，继续后续步骤")
+            return_rules_ok = True
             notes.append("退货规则已保存")
         except Exception as e:
+            if page_unavailable(e):
+                raise
+            retryable = retryable or retryable_browser_error(e)
             notes.append(f"退货规则失败：{e}")
             self._log(notes[-1])
 
         try:
-            policy_notes = self.setup_written_policies()
+            if not self._completed("policies"):
+                policy_notes = self.setup_written_policies()
+                self._checkpoint("policies")
+            else:
+                policy_notes = []
+                self._log("书面政策此前已完成，继续后续步骤")
+            policies_ok = True
             notes.append("书面政策已发布")
             notes.extend(policy_notes or [])
         except Exception as e:
+            if page_unavailable(e):
+                raise
+            retryable = retryable or retryable_browser_error(e)
             notes.append(f"书面政策失败：{e}")
             self._log(notes[-1])
 
         if csv_path:
             try:
-                self.import_products(csv_path)
+                if not self._completed("products"):
+                    self.import_products(csv_path)
+                    self._checkpoint("products")
+                products_ok = True
                 notes.append("产品已导入")
             except Exception as e:
+                if page_unavailable(e):
+                    raise
                 notes.append(f"导入产品失败：{e}")
                 self._log(notes[-1])
         else:
             notes.append("未填产品CSV，跳过导入")
             self._log(notes[-1])
 
-        ok = (
-            "失败" not in "；".join(notes)
-            and "退货规则已保存" in notes
-            and "书面政策已发布" in notes
-        )
-        if csv_path and "产品已导入" not in notes:
-            ok = False
-        return {"ok": ok, "setup_notes": "；".join(notes), "admin_url": self.page.url}
+        # 资料核对仅作提示；按必需步骤的实际结果判断，不能扫描备注里的“失败”字样。
+        ok = return_rules_ok and policies_ok and products_ok
+        return {"ok": ok, "setup_notes": "；".join(notes), "admin_url": self.admin_base(), "retryable": retryable}
 
     def _page_text(self) -> str:
         try:
@@ -199,12 +313,14 @@ class StoreSetup:
             except Exception:
                 return ""
 
-    def _fill_profile_field(self, label: str, value: str, replace_default=False) -> bool:
+    def _fill_profile_field(self, label: str, value: str, replace_default=False, optional=False) -> bool:
         """按可访问标签定位字段，保留已填写内容（默认店名除外）。"""
         if not value:
             return False
         loc = self.page.get_by_label(re.compile(label, re.I)).first
         if not self._visible(loc, timeout=3000):
+            if optional:
+                return False
             raise RuntimeError(f"找不到店铺资料字段：{label}")
         current = (loc.input_value() or "").strip()
         is_default = replace_default and current.lower() in ("my store", "我的商店", "我的店铺")
@@ -224,28 +340,37 @@ class StoreSetup:
             raise RuntimeError(f"填写店铺资料失败：{label}")
         return True
 
-    def _save_profile_changes(self):
+    def _save_profile_changes(self, timeout=45000):
         save = self.page.get_by_role("button", name=re.compile(r"^(Save|保存)$", re.I)).last
         save.click(timeout=10000)
-        for _ in range(60):
-            if not save.is_visible() or save.is_disabled():
+        deadline = time.monotonic() + timeout / 1000
+        while True:
+            self.bot._check_cancel()
+            # Disabled also means "saving". The save bar/dialog must close
+            # before navigating away or recording a completed profile step.
+            if not save.is_visible():
                 return
-            self.page.wait_for_timeout(250)
-        raise RuntimeError("店铺资料点击保存后仍有未保存内容，请检查页面校验提示")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise PageLoadError("店铺资料保存尚未确认：保存按钮仍显示，未继续跳转；请检查页面保存或校验提示")
+            self.page.wait_for_timeout(min(250, max(1, int(remaining * 1000))))
 
     def _open_store_contact_details(self):
-        self._goto_admin("settings/general", dismiss=False)
         link = self.page.locator('a[href$="/settings/general/store-contact-details"]:visible').first
         field = self.page.get_by_label(re.compile(r"^(Store name|店铺名称)$", re.I)).first
-        try:
-            link.or_(field).first.wait_for(state="visible", timeout=30000)
-            if not field.is_visible():
-                link.click(timeout=10000)
-            field.wait_for(state="visible", timeout=30000)
-        except PlaywrightTimeout as e:
-            raise RuntimeError(
-                f"店铺联系信息页面未加载或入口已变化：{self.page.url}；请检查 Shopify 页面是否提示加载错误"
-            ) from e
+
+        contact_path = "settings/general/store-contact-details"
+        if (admin_store_base(self.page.url) == self.admin_base()
+                and urlsplit(self.page.url).path.rstrip("/") == urlsplit(self.admin_base() + "/" + contact_path).path):
+            self._open_loaded(contact_path, "店铺联系信息",
+                              lambda timeout: field.wait_for(state="visible", timeout=timeout))
+            return
+
+        self._open_loaded("settings/general", "店铺联系信息入口",
+                          lambda timeout: link.or_(field).first.wait_for(state="visible", timeout=timeout))
+        if not field.is_visible():
+            self._open_loaded("settings/general/store-contact-details", "店铺联系信息",
+                              lambda timeout: field.wait_for(state="visible", timeout=timeout))
 
     def setup_store_profile(self):
         """兼容常规页直接编辑和新版独立联系信息页，补齐空白字段。"""
@@ -267,12 +392,13 @@ class StoreSetup:
             self._log("未提供店铺地址，跳过")
             return
 
-        self._goto_admin("settings/general", dismiss=False)
-        address = self.page.get_by_role("button", name=re.compile(r"^(Store address|店铺地址)$", re.I)).first
-        if self._visible(address, timeout=5000):
-            address.click(timeout=5000)
-        elif not self._click(["Edit store address", "Edit", "编辑"], timeout=3000):
-            raise RuntimeError("找不到店铺地址编辑入口")
+        address_name = re.compile(r"^(Store address|店铺地址)(?:\s|$)", re.I)
+        address = self.page.get_by_role("button", name=address_name).or_(
+            self.page.get_by_role("link", name=address_name)
+        )
+        entry = address.or_(self.page.get_by_role("button", name=re.compile(r"^(Edit store address|Edit|编辑)$", re.I))).first
+        self._open_loaded("settings/general", "店铺地址入口", lambda timeout: entry.wait_for(state="visible", timeout=timeout))
+        entry.click(timeout=5000)
         street = self.page.get_by_label(re.compile(r"^(Street and house number|Address|地址)$", re.I)).first
         street.wait_for(state="visible", timeout=15000)
         changed = False
@@ -281,9 +407,11 @@ class StoreSetup:
             (r"^(Street and house number|Address|地址)$", self.bot.address),
             (r"^(City|城市)$", self.bot.city),
             (r"^(ZIP code|Postal code|邮编)$", self.bot.zip_code),
-            (r"^(Province|State|State/province|州/省)$", self.bot.province),
         ):
             changed = self._fill_profile_field(label, value) or changed
+        # Countries such as France do not expose a province field.
+        changed = self._fill_profile_field(r"^(Province|State|State/province|州/省)$",
+                                           self.bot.province, optional=True) or changed
         if changed:
             self._save_profile_changes()
             street.wait_for(state="hidden", timeout=15000)
@@ -527,13 +655,15 @@ class StoreSetup:
 
     def _open_default_rules(self) -> bool:
         """Policies 列表里 Default rules 是 a[href*=cancel-return-rules]，不是按钮。"""
-        self._goto_admin("settings/legal")
-        self.page.locator("#return-rules").wait_for(state="visible", timeout=20000)
+        entry = self.page.locator('a[href*="/settings/legal/cancel-return-rules/"]').or_(
+            self.page.get_by_role("link", name=re.compile(r"Default rules", re.I))
+        ).first
+        self._open_loaded("settings/legal", "退货规则入口", lambda timeout: entry.wait_for(state="visible", timeout=timeout))
         existing = self.page.locator(
-            '#return-rules a[href*="/settings/legal/cancel-return-rules/"]:not([href$="/new"])'
+            'a[href*="/settings/legal/cancel-return-rules/"]:not([href$="/new"])'
         ).first
         create = self.page.locator(
-            '#return-rules a[href*="/settings/legal/cancel-return-rules/"]'
+            'a[href*="/settings/legal/cancel-return-rules/"]'
         ).first
         link = existing if self._visible(existing, timeout=2500) else create
         if not self._visible(link, timeout=4000):
@@ -543,27 +673,15 @@ class StoreSetup:
             return False
         href = link.get_attribute("href") or ""
         self._log(f"打开 Default rules：{href}")
-        try:
-            link.click(timeout=5000)
-        except Exception as e:
-            self._log(f"点击 Default rules 失败：{e}")
-        try:
-            self.page.wait_for_url(re.compile(r"cancel-return-rules/"), timeout=8000)
-        except PlaywrightTimeout:
-            if href.startswith("/"):
-                self.page.goto(
-                    "https://admin.shopify.com" + href,
-                    wait_until="domcontentloaded",
-                    timeout=45000,
-                )
-            elif href:
-                self.page.goto(href, wait_until="domcontentloaded", timeout=45000)
-            else:
-                return False
-        self._sleep()
-        if not re.search(r"cancel-return-rules/", self.page.url or ""):
-            self._log(f"未进入 Default rules 页：{self.page.url}")
+        prefix = urlsplit(self.admin_base()).path + "/"
+        parsed = urlsplit(href)
+        if (parsed.netloc and parsed.netloc != "admin.shopify.com") or not parsed.path.startswith(prefix + "settings/legal/cancel-return-rules/"):
             return False
+        path = parsed.path[len(prefix):]
+        controls = self.page.get_by_text("Return rules", exact=True).or_(
+            self.page.get_by_text("Cancellation rules", exact=True)
+        ).first
+        self._open_loaded(path, "退货规则编辑页", lambda timeout: controls.wait_for(state="visible", timeout=timeout))
         return True
 
     def _turn_on_all_rule_switches(self):
@@ -683,20 +801,16 @@ class StoreSetup:
         except Exception:
             btn = save.first
         if btn is None or not self._visible(btn, timeout=1500):
-            self._log("看到未保存提示但找不到 Save，继续后续流程")
-            return
+            raise RuntimeError("退货规则仍有未保存内容，但找不到 Save")
         try:
             if btn.is_disabled():
-                self._log("Save 不可点，继续后续流程")
-                return
+                raise RuntimeError("退货规则仍有未保存内容，Save 不可点")
             btn.click(timeout=4000, force=True)
             self._log("已点 Default rules 的 Save")
-            try:
-                bar.wait_for(state="hidden", timeout=10000)
-            except PlaywrightTimeout:
-                pass
+            bar.wait_for(state="hidden", timeout=10000)
         except Exception as e:
-            self._log(f"点 Save 失败，继续后续流程：{e}")
+            self._log(f"退货规则保存未确认：{e}")
+            raise
 
     def setup_return_rules(self):
         if not self._open_default_rules():
@@ -716,7 +830,8 @@ class StoreSetup:
             )
             self._select_radio("Collections")
         except Exception as e:
-            self._log(f"填写 Default rules 出错，仍继续：{e}")
+            self._log(f"填写 Default rules 出错：{e}")
+            raise
         self._save_default_rules_if_needed()
         self._log("退货/取消规则已处理")
         self._sleep()
@@ -742,23 +857,12 @@ class StoreSetup:
         if not path:
             self._log(f"未知政策：{name}")
             return False
-        slug = path.rsplit("/", 1)[-1]
-        self._goto_admin(path, dismiss=False)
-        try:
-            self.page.wait_for_url(re.compile(rf"/settings/legal/{re.escape(slug)}"), timeout=15000)
-        except PlaywrightTimeout:
-            self._log(f"政策 URL 未跳转：{self.page.url}")
-            return False
-        heading = self.page.get_by_text(name, exact=True).first
-        insert = self.page.get_by_role("button", name=re.compile(r"Insert template", re.I)).first
-        cancel = self.page.get_by_role("button", name=re.compile(r"^Cancel$", re.I)).first
-        publish = self.page.get_by_role("button", name=re.compile(r"^Publish$", re.I)).first
-        save = self.page.get_by_role("button", name=re.compile(r"^Save$", re.I)).first
-        for loc, ms in ((heading, 8000), (insert, 3000), (cancel, 3000), (publish, 2000), (save, 2000)):
-            if self._visible(loc, timeout=ms):
-                return True
-        self._log(f"政策编辑页未出现：{name} {self.page.url}")
-        return False
+        editor = self.page.locator(
+            '[contenteditable="true"], textarea, iframe[title*="policy" i], '
+            '.tox-edit-area iframe, iframe.tox-edit-area__iframe'
+        ).first
+        self._open_loaded(path, name + "编辑页", lambda timeout: editor.wait_for(state="visible", timeout=timeout))
+        return True
 
     def _click_cancel(self) -> bool:
         """政策弹窗有内容时点 Cancel 关闭，不要 Save。"""
@@ -1163,11 +1267,9 @@ class StoreSetup:
                 raise RuntimeError(f"{policy_name} 写入编辑器失败")
             return None
 
-        self._goto_admin("settings/legal")
         # 先确认列表已加载，再判断可选入口是否存在，避免把加载失败当成无需填写。
-        self.page.locator('a[href$="/settings/legal/refund"]').first.wait_for(
-            state="visible", timeout=30000
-        )
+        refund = self.page.locator('a[href$="/settings/legal/refund"]').first
+        self._open_loaded("settings/legal", "书面政策列表", lambda timeout: refund.wait_for(state="visible", timeout=timeout))
         sale_available = self.page.locator(
             'a[href$="/settings/legal/terms-of-sale"]'
         ).count() > 0 or self.page.get_by_role(

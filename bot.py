@@ -4,10 +4,13 @@ import re
 import secrets
 import string
 import time
+from urllib.parse import urlsplit
 
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
 from adspower_client import AdsPowerClient
+from shopify_admin import admin_store_base
+from browser_recovery import FirstPageUnavailable, PageLoadError, browser_disconnected, browser_error_page, reload_page, retryable_browser_error, wait_for_ready
 
 
 class ShopifyBot:
@@ -32,6 +35,9 @@ class ShopifyBot:
         self.browser = None
         self.page = None
         self._started_profile = False
+        self.admin_url = ""
+        self._password_refreshes = 0
+        self._account_handoffs = 0
 
     def _generate_password(self) -> str:
         alphabet = string.ascii_letters + string.digits
@@ -39,6 +45,12 @@ class ShopifyBot:
 
     def _log(self, msg):
         print(msg, flush=True)
+
+    def _ask_user(self, message, kind="continue"):
+        return input(message)
+
+    def _check_cancel(self):
+        pass
 
     def _sleep(self, short=False):
         lo = 0.4 if short else self.config.getfloat("settings", "min_wait")
@@ -116,31 +128,240 @@ class ShopifyBot:
         return False
 
     def _on_shopify(self) -> bool:
-        return "shopify.com" in (self.page.url or "").lower()
+        try:
+            parts = urlsplit(self.page.url or "")
+        except ValueError:
+            return False
+        return parts.scheme == "https" and parts.netloc.lower() in (
+            "shopify.com", "www.shopify.com", "admin.shopify.com", "accounts.shopify.com",
+        )
+
+    def _entry_ready(self, timeout=1000):
+        """Recognize an interactive entry or hand off a store URL to admin checks."""
+        if not self._on_shopify():
+            return False
+        if admin_store_base(self.page.url):
+            # This is not login success: _wait_for_admin still checks store UI.
+            self._remember_admin()
+            return True
+        if self._on_account_profile():
+            return self._locator_ready(self.page.get_by_text(self.email, exact=True).first, timeout=timeout)
+        if self._on_account_selection():
+            return self._locator_ready(self.page.get_by_role("heading", name="Choose an account").first.or_(
+                self.page.get_by_text(self.email, exact=True)).first, timeout=timeout)
+        if self._on_store_selection():
+            try:
+                stores = self._visible_store_links(timeout=timeout)
+            except PageLoadError:
+                return False
+            if stores is None:
+                return False
+            return bool(stores) or self._locator_ready(
+                self.page.get_by_text("Create your first online store", exact=True).first, timeout=timeout)
+        fields = self.page.locator(
+            'input[type="email"]:enabled:not([readonly]):visible, '
+            'input[name="email"]:enabled:not([readonly]):visible, '
+            'input[type="password"]:enabled:not([readonly]):visible, '
+            'input[autocomplete="one-time-code"]:enabled:not([readonly]):visible, '
+            'input[name="verificationCode"]:enabled:not([readonly]):visible, '
+            'input[name="shopName"]:enabled:not([readonly]):visible, '
+            'input[name="shop_name"]:enabled:not([readonly]):visible, '
+            'iframe[src*="challenges.cloudflare.com"]:visible, #challenge-running:visible, .cf-challenge:visible'
+        )
+        actions = re.compile(r"^(Continue(?: with email)?|Start free trial|Create(?: your)? account|"
+                             r"Skip(?: all| for now)?|Next|Log in|Sign in|继续|跳过|创建账户)$", re.I)
+        visible = self.page.locator(":visible:not([disabled]):not([aria-disabled='true'])")
+        ready = fields.or_(self.page.get_by_role("button", name=actions).and_(visible)).or_(
+            self.page.get_by_role("link", name=actions).and_(visible)
+        )
+        return self._locator_ready(ready.first, timeout=timeout)
+
+    def _open_entry(self, url, label, timeout=180000, max_timeout=300000, skip_slow=False):
+        """Do not restart a slow first document or an existing signup redirect."""
+        if skip_slow:
+            timeout = min(timeout, 60000)
+            max_timeout = timeout
+        attempts = 1 if skip_slow else 2
+        current = urlsplit(self.page.url or "")
+        in_signup = self._on_shopify() and (
+            any(part in current.path.lower() for part in ("signup", "password", "challenge", "verify", "verification"))
+            or self.page.locator('input[autocomplete="one-time-code"]:visible, input[name="verificationCode"]:visible').count() > 0
+        )
+        reuse = self._on_shopify() and (
+            url == "https://admin.shopify.com" or self.page.url == url
+            or in_signup or bool(admin_store_base(self.page.url))
+            or (urlsplit(url).netloc == "accounts.shopify.com"
+                and (self._on_account_profile() or self._on_account_selection()
+                     or self._on_store_selection() or current.path.rstrip("/") == "/login"))
+        )
+        last_error = None
+        for attempt in range(attempts):
+            self._check_cancel()
+            if (reuse or attempt) and self._entry_ready(timeout=200):
+                self._log(f"{label}已就绪，沿用当前页面")
+                return
+            started = time.monotonic()
+            try:
+                if attempt and self._on_shopify():
+                    last_error = reload_page(self.page, self._log, label, attempt, limit=1)
+                elif attempt or not reuse:
+                    self._log(f"打开{label}，等待页面响应和表单加载（{attempt + 1}/{attempts}）")
+                    response = self.page.goto(url, wait_until="commit", timeout=min(timeout, 30000))
+                    if response and response.status >= 400:
+                        if response.status == 429:
+                            raise RuntimeError("Shopify 返回 HTTP 429，请稍后重试；停止自动刷新")
+                        error_type = PageLoadError if response.status in (408, 429) or response.status >= 500 else RuntimeError
+                        raise error_type(f"{label}返回 HTTP {response.status}")
+                else:
+                    self._log(f"沿用正在加载的{label}，暂不重新打开")
+            except Exception as exc:
+                if skip_slow and any(token in str(exc) for token in (
+                        "ERR_SOCKS_", "ERR_PROXY_", "ERR_TUNNEL_CONNECTION_FAILED")):
+                    raise FirstPageUnavailable(f"首屏代理连接失败，已跳过；{str(exc).splitlines()[0]}") from exc
+                if browser_disconnected(exc) or not retryable_browser_error(exc):
+                    raise
+                last_error = exc
+                self._log(f"{label}导航尚未完成，保留当前页面继续等待：{str(exc).splitlines()[0]}")
+            elapsed = int((time.monotonic() - started) * 1000)
+            try:
+                ready = wait_for_ready(self.page, self._entry_ready, self._log, label, self._check_cancel,
+                                       timeout=max(1, timeout - elapsed), max_timeout=max(1, max_timeout - elapsed))
+            except RuntimeError as exc:
+                if skip_slow and any(token in str(exc) for token in (
+                        "ERR_SOCKS_", "ERR_PROXY_", "ERR_TUNNEL_CONNECTION_FAILED")):
+                    raise FirstPageUnavailable(f"首屏代理连接失败，已跳过；{str(exc).splitlines()[0]}") from exc
+                raise
+            if ready or self._entry_ready(timeout=200):
+                self._log(f"{label}已加载，继续处理")
+                return
+        detail = str(last_error).splitlines()[0] if last_error else "未出现可用的登录/注册表单"
+        if skip_slow:
+            raise FirstPageUnavailable(f"首屏等待 {timeout // 1000} 秒仍未加载，已跳过；{detail}") from last_error
+        raise PageLoadError(f"{label}等待并重试后仍未就绪，请检查当前环境网络或稍后重试；{detail}") from last_error
 
     def _goto_signup(self, url):
-        current = (self.page.url or "").lower()
-        if "shopify.com" in current and ("signup" in current or "password" in current or "challenge" in current):
-            self._log(f"已在注册流程中，跳过重复打开：{self.page.url}")
-            return
-        last_error = None
-        for i in range(1, 3):
-            try:
-                self.page.goto(url, wait_until="domcontentloaded", timeout=25000)
-                return
-            except Exception as e:
-                last_error = e
-                self._log(f"打开页面失败（{i}/2）：{str(e).splitlines()[0]}")
-                if self._on_shopify():
-                    self._log("导航报错但页面已在 Shopify，继续。")
-                    return
-                time.sleep(2)
-        if self._on_shopify():
-            return
-        raise RuntimeError(
-            "无法打开 Shopify 注册页，AdsPower 环境的代理连不上。"
-            f"请先在环境 {self.profile_id} 里把代理测通。原始错误：{last_error}"
-        )
+        self._open_entry(url, "Shopify 注册页", skip_slow=True)
+
+    def _on_account_profile(self):
+        return bool(re.match(r"^https://accounts\.shopify\.com/accounts/[^/?#]+/personal(?:[/?#]|$)",
+                             self.page.url or "", re.I))
+
+    def _on_account_selection(self):
+        return bool(re.match(r"^https://accounts\.shopify\.com/select(?:[/?#]|$)", self.page.url or "", re.I))
+
+    def _handle_account_selection(self):
+        if not self._on_account_selection():
+            return False
+        account = self.page.get_by_text(self.email, exact=True).and_(self.page.locator(":visible")).first
+        if not self._locator_ready(account, timeout=3000):
+            raise RuntimeError("账号选择页未找到本任务邮箱，请确认当前环境中的登录账号")
+        submitted_url = self.page.url
+        self._check_cancel()
+        account.click(timeout=10000, no_wait_after=True)
+        self._log("已选择本任务 Shopify 账号，等待继续")
+        if not wait_for_ready(self.page, lambda _: self.page.url != submitted_url,
+                              self._log, "账号选择结果", self._check_cancel,
+                              timeout=60000, max_timeout=60000):
+            raise PageLoadError("选择账号后未进入下一步，已停止重复点击")
+        return True
+
+    def _on_store_selection(self):
+        current = urlsplit(self.page.url or "")
+        return current.scheme == "https" and current.netloc == "admin.shopify.com" and current.path in ("", "/")
+
+    def _visible_store_links(self, timeout=60000):
+        """Read one document snapshot; None means navigation, not an empty list."""
+        source_url = self.page.url
+        stores = None
+
+        def read_snapshot(_):
+            nonlocal stores
+            if self.page.url != source_url:
+                return True
+            # Reading each locator separately could mix two documents when
+            # Shopify redirects. Capture the URL, hrefs and names together.
+            snapshot = self.page.locator('a[href]:visible').evaluate_all("""links => ({
+                url: location.href,
+                links: links.map(link => ({href: link.href, name: link.innerText || ''}))
+            })""")
+            if snapshot["url"] != source_url or self.page.url != source_url:
+                return True
+            stores = {}
+            for link in snapshot["links"]:
+                base = admin_store_base(link["href"])
+                if base:
+                    stores[base] = link["name"].strip()
+            return True
+
+        if not wait_for_ready(self.page, read_snapshot, self._log, "店铺列表读取", self._check_cancel,
+                              timeout=timeout, max_timeout=timeout):
+            raise PageLoadError("店铺列表在等待期限内仍无法读取，已保留当前账号和任务进度")
+        return stores
+
+    def _choose_existing_store(self, stores):
+        saved = admin_store_base(self.data.get("店铺后台"))
+        if saved:
+            return saved
+        if len(stores) == 1:
+            return next(iter(stores))
+        if stores:
+            matches = [base for base, name in stores.items() if name.casefold() == self.shop_name.casefold()]
+            if len(matches) != 1:
+                raise RuntimeError("当前账号有多个店铺，无法确认本任务店铺；请绑定对应的店铺后台地址")
+            return matches[0]
+        return ""
+
+    def _handle_store_selection(self):
+        if not self._on_store_selection():
+            return False
+        stores = self._visible_store_links()
+        if stores is None or not self._on_store_selection():
+            return True
+        target = self._choose_existing_store(stores)
+        if target:
+            self._log("沿用账号已有店铺：" + target)
+            self._open_entry(target, "Shopify 已有店铺")
+            return True
+        empty = self.page.get_by_text("Create your first online store", exact=True).first
+        if not empty.is_visible():
+            return False
+        create = self.page.get_by_role("button", name="Create store", exact=True).or_(
+            self.page.get_by_role("link", name="Create store", exact=True)
+        ).and_(self.page.locator(":visible")).first
+        self._check_cancel()
+        submitted_url = self.page.url
+        create.click(timeout=10000, no_wait_after=True)
+        self._log("账号尚无店铺，已点击 Create store，继续创建本任务店铺")
+        if not wait_for_ready(self.page, lambda _: self.page.url != submitted_url or not empty.is_visible(),
+                              self._log, "Create store 提交结果", self._check_cancel,
+                              timeout=90000, max_timeout=90000):
+            raise PageLoadError("Create store 提交后未进入下一步，已停止重复点击")
+        return True
+
+    def _continue_from_account_profile(self):
+        """An account profile is not a store: resume the merchant flow."""
+        if not self._on_account_profile():
+            return False
+        ready = wait_for_ready(self.page, self._entry_ready, self._log, "Shopify 账号资料页",
+                               self._check_cancel, timeout=60000, max_timeout=60000,
+                               still_applicable=self._on_account_profile)
+        if not self._on_account_profile():
+            return True
+        if not ready and not self._entry_ready(timeout=200):
+            raise RuntimeError("账号资料页未显示本任务邮箱，请确认登录的是本任务账号；未继续开店")
+        # Reuse an existing store displayed on this account before offering to
+        # create one. Never guess a handle from the requested store name.
+        stores = self._visible_store_links()
+        if stores is None or not self._on_account_profile():
+            return True
+        target = self._choose_existing_store(stores)
+        if self._account_handoffs >= 2:
+            raise RuntimeError("账号已登录，但开店入口仍返回账号资料页；请检查页面提示，已停止重复跳转")
+        self._account_handoffs += 1
+        self._log("已进入 Shopify 账号资料页；沿用当前账号继续" + ("已有店铺" if target else "查看店铺列表"))
+        target = target or "https://admin.shopify.com/?no_redirect=true"
+        self._open_entry(target, "Shopify 店铺入口")
+        return True
 
     def _maybe_wait_challenge(self):
         overlay = self.page.locator(
@@ -148,17 +369,80 @@ class ShopifyBot:
         ).first
         try:
             if overlay.is_visible(timeout=600):
-                input("检测到人机验证，请在 AdsPower 窗口中完成后回到这里按回车继续...")
+                self._ask_user("检测到人机验证，请在 AdsPower 窗口中完成后继续...")
         except PlaywrightTimeout:
             return
 
-    def _looks_logged_in(self) -> bool:
-        url = (self.page.url or "").lower()
-        if "admin.shopify.com/store" in url:
-            return True
-        if "admin.shopify.com" in url and "signup" not in url and "accounts.shopify.com" not in url:
-            return True
+    def _looks_logged_in(self, timeout=1200) -> bool:
+        base = admin_store_base(self.page.url)
+        saved = admin_store_base(self.data.get("店铺后台"))
+        if not base or (saved and saved != base):
+            return False
+        # A URL alone also matches a loading/error page. Require the actual
+        # store navigation before treating registration/login as complete.
+        path = base[len("https://admin.shopify.com"):]
+        selectors = [
+            '{} a[href="{}{}"]:visible'.format(nav, prefix, suffix)
+            for nav in ("nav", '[role="navigation"]')
+            for prefix in (path, base)
+            for suffix in ("/orders", "/products", "/settings", "/settings/general")
+        ]
+        if not self._locator_ready(self.page.locator(", ".join(selectors)).first, timeout=timeout):
+            return False
+        if admin_store_base(self.page.url) != base:
+            return False
+        self.admin_url = base
+        return True
+
+    def _remember_admin(self):
+        """Persist an observed store address without declaring its UI ready."""
+        base = admin_store_base(self.page.url)
+        if base and not admin_store_base(self.data.get("店铺后台")):
+            self.data["店铺后台"] = base
+            self._log(f"已记录店铺地址：{base}；继续等待后台加载")
+            return base
+        return ""
+
+    def _wait_for_admin(self, timeout=120000, max_timeout=300000) -> bool:
+        for attempt in range(3):
+            self._check_cancel()
+            try:
+                if attempt:
+                    if self._looks_logged_in(timeout=200):
+                        self._log("Shopify 后台已恢复，取消本次刷新")
+                        return True
+                    # Only one navigation per retry. Never reload an error
+                    # document and immediately follow it with another goto.
+                    saved = admin_store_base(self.data.get("店铺后台"))
+                    if browser_error_page(self.page.url) and saved:
+                        self._log(f"Shopify 后台等待后仍未恢复，重新打开原店铺（{attempt}/2）")
+                        self.page.goto(saved, wait_until="commit", timeout=25000)
+                    else:
+                        reload_page(self.page, self._log, "Shopify 后台", attempt)
+                self.page.wait_for_url(
+                    re.compile(r"^https://admin\.shopify\.com/store/[a-z0-9][a-z0-9-]*(?:[/?#]|$)", re.I),
+                    wait_until="commit", timeout=min(timeout, 20000),
+                )
+            except Exception as exc:
+                if browser_disconnected(exc) or not retryable_browser_error(exc):
+                    raise
+                self._log("后台导航未完成，先检查页面恢复，暂不刷新：" + str(exc).splitlines()[0])
+            self._remember_admin()
+            expected = admin_store_base(self.data.get("店铺后台"))
+            # Login/verification forms need input, not repeated reloads.
+            if not expected or (not admin_store_base(self.page.url) and not browser_error_page(self.page.url)):
+                return False
+            if wait_for_ready(self.page, self._looks_logged_in, self._log, "Shopify 后台",
+                              self._check_cancel, timeout=timeout, max_timeout=max_timeout,
+                              still_applicable=lambda: (admin_store_base(self.page.url) == expected
+                                                       or browser_error_page(self.page.url))):
+                return True
         return False
+
+    def _checkpoint_setup(self, step):
+        completed = self.data.setdefault("_setup_completed", [])
+        if step not in completed:
+            completed.append(step)
 
     def _get_email_verification_code(self, retries=8, delay=8):
         imap_server = self.data.get("IMAP服务器") or self.config.get("settings", "imap_server")
@@ -208,7 +492,100 @@ class ShopifyBot:
             parts.append(payload.decode("utf-8", errors="ignore"))
         return "\n".join(parts)
 
+    def _recover_password_page(self, reason):
+        self._check_cancel()
+        if self._password_refreshes >= 2:
+            raise RuntimeError("密码页刷新 2 次后仍未推进，请检查页面提示；已停止重复提交")
+        self._password_refreshes += 1
+        self._log(reason + "；刷新密码页后继续，保留原邮箱和密码")
+        reload_page(self.page, self._log, "Shopify 密码页", self._password_refreshes)
+        if not wait_for_ready(self.page, self._entry_ready, self._log, "Shopify 密码页", self._check_cancel,
+                              timeout=180000, max_timeout=300000):
+            raise PageLoadError("密码页刷新后尚未恢复")
+
+    def _pending_signup_name_fields(self):
+        fields = (
+            ("First name", r"^(First name|Given name|名字|名)$",
+             'input[autocomplete="given-name"], input[name="firstName"], input[name="first_name"]'),
+            ("Last name", r"^(Last name|Family name|Surname|姓氏|姓)$",
+             'input[autocomplete="family-name"], input[name="lastName"], input[name="last_name"]'),
+        )
+        pending = []
+        for index, (label, pattern, selector) in enumerate(fields):
+            field = self.page.get_by_label(re.compile(pattern, re.I)).or_(
+                self.page.get_by_placeholder(re.compile(pattern, re.I))
+            ).or_(self.page.locator(selector)).and_(self.page.locator("input:visible")).first
+            if field.is_visible() and field.is_editable() and not field.input_value().strip():
+                pending.append((index, label, field))
+        return pending
+
+    def _fill_signup_contact_names(self):
+        pending = self._pending_signup_name_fields()
+        if not pending:
+            return False
+        full_name = " ".join(self.contact_name.split())
+        first_name = " ".join(self.data.get("联系人名", "").split())
+        last_name = " ".join(self.data.get("联系人姓", "").split())
+        # Preserve compound surnames from the contact source. Old records and
+        # manually edited full names use the final word as the surname.
+        if not first_name or not last_name or full_name != first_name + " " + last_name:
+            parts = full_name.rsplit(None, 1)
+            first_name = parts[0] if parts else ""
+            last_name = parts[1] if len(parts) == 2 else ""
+        values = (first_name, last_name)
+        if any(not values[index] for index, _, _ in pending):
+            raise RuntimeError("注册页要求 First name / Last name，但联系人姓名不完整，请补全本任务联系人资料")
+        for index, label, field in pending:
+            self._check_cancel()
+            if not self._fill_locator(field, values[index]) or field.input_value().strip() != values[index]:
+                raise RuntimeError("注册页联系人姓名填写失败：" + label)
+            field.press("Tab")
+        self._log("已按本任务联系人资料补填注册姓名（First name / Last name）")
+        return True
+
+    def _wait_password_result(self, submitted_url, timeout=90000, action="Create account"):
+        """Observe one submission instead of retyping/clicking on every loop."""
+        started = time.monotonic()
+        next_log = started + 30
+        password = self.page.locator('input[type="password"]:visible, input[name="password"]:visible, input[autocomplete="new-password"]:visible').first
+        challenge = self.page.locator("iframe[src*='challenges.cloudflare.com']:visible, #challenge-running:visible, .cf-challenge:visible").first
+        code = self.page.locator('input[autocomplete="one-time-code"]:visible, input[name="verificationCode"]:visible').first
+        while (time.monotonic() - started) * 1000 < timeout:
+            self._check_cancel()
+            if self.page.url != submitted_url or code.is_visible() or not password.is_visible():
+                return
+            if challenge.is_visible():
+                self._maybe_wait_challenge()
+                return
+            if action == "Create account" and self._pending_signup_name_fields():
+                # The server may request names after the initial submission.
+                # Return to the form handler instead of refreshing them away.
+                return
+            if password.get_attribute("aria-invalid") == "true":
+                raise RuntimeError("密码页提示输入有误，请检查页面的校验提示；已停止重复提交")
+            self.page.wait_for_timeout(500)
+            if time.monotonic() >= next_log:
+                self._log(f"等待 {action} 提交结果、页面跳转或验证，暂不重复点击")
+                next_log = time.monotonic() + 30
+        # One last read before refreshing, in case a navigation just completed.
+        if self.page.url != submitted_url or code.is_visible() or not password.is_visible():
+            return
+        if challenge.is_visible():
+            self._maybe_wait_challenge()
+            return
+        if action == "Create account" and self._pending_signup_name_fields():
+            return
+        self._recover_password_page(f"{action} 提交后长时间停在同一密码页，未出现下一步")
+
     def _handle_password_step(self) -> bool:
+        if not self._on_shopify() or self._on_account_profile():
+            return False
+        login_button = self.page.get_by_role("button", name=re.compile(r"^(Log in|Login|Sign in|登录)$", re.I)).and_(self.page.locator(":visible")).first
+        is_login = login_button.is_visible() or (
+            urlsplit(self.page.url).netloc == "accounts.shopify.com"
+            and urlsplit(self.page.url).path.rstrip("/") == "/login"
+        )
+        action = "Log in" if is_login else "Create account"
         pwd_loc = None
         candidates = [
             self.page.get_by_label("Create a password"),
@@ -221,12 +598,14 @@ class ShopifyBot:
             current = loc.first
             if self._locator_ready(current, timeout=800, need_editable=True):
                 pwd_loc = current
+                if current.input_value() == self.password:
+                    break
                 if self._fill_locator(current, self.password):
                     self._log("已填写 Shopify 密码")
                 break
         if not pwd_loc:
             # 密码已填好、输入框可能仍可见：只要页面有 Create account 也算这一步
-            create_btn = self.page.get_by_role("button", name="Create account").first
+            create_btn = login_button if is_login else self.page.get_by_role("button", name="Create account").first
             if not self._locator_ready(create_btn, timeout=600):
                 return False
         else:
@@ -236,17 +615,76 @@ class ShopifyBot:
                 pass
             self._sleep(short=True)
 
-        clicked = self._click_button(
-            ["Create account", "Create your account", "Continue", "创建账户"]
-        )
-        if not clicked and pwd_loc:
-            try:
-                pwd_loc.press("Enter")
-                self._log("已在密码框按回车提交")
-                clicked = True
-            except Exception as e:
-                self._log(f"回车提交失败：{e}")
-        return clicked or pwd_loc is not None
+        submitted_url = self.page.url
+        if pwd_loc and pwd_loc.input_value() != self.password:
+            self._recover_password_page("密码输入后没有保留在字段中")
+            return True
+        if not is_login:
+            self._fill_signup_contact_names()
+        submit = self.page.get_by_role("button", name=re.compile(
+            r"^(Log in|Login|Sign in|Continue|登录)$" if is_login else
+            r"^(Create account|Create your account|Continue|创建账户)$", re.I
+        )).and_(self.page.locator(":visible")).first
+        challenge = self.page.locator("iframe[src*='challenges.cloudflare.com']:visible, #challenge-running:visible, .cf-challenge:visible").first
+
+        def can_submit(wait):
+            if self.page.url != submitted_url or challenge.is_visible():
+                return True
+            if not is_login and self._pending_signup_name_fields():
+                return True
+            return self._locator_ready(submit, timeout=wait) and submit.is_enabled()
+
+        ready = wait_for_ready(self.page, can_submit, self._log, action + " 按钮", self._check_cancel,
+                               timeout=120000, max_timeout=120000)
+        # The button may become enabled as the wait expires. Re-read it before
+        # deciding to refresh, so an actionable form is submitted immediately.
+        if not ready and not can_submit(250):
+            self._recover_password_page(action + " 按钮长时间不可用")
+            return True
+        if self.page.url != submitted_url:
+            return True
+        if challenge.is_visible():
+            self._maybe_wait_challenge()
+            return True
+        if not is_login and self._fill_signup_contact_names():
+            # Fields appeared while waiting. The next form pass checks the
+            # button after input validation, without a refresh or forced click.
+            return True
+        try:
+            # Normal actionability checks prevent a disabled button from being
+            # force-clicked and incorrectly logged as a successful submission.
+            submit.click(timeout=10000, no_wait_after=True)
+            self._log(f"已点击：{action}；开始等待提交结果")
+        except PlaywrightTimeout as exc:
+            if self.page.url != submitted_url:
+                return True
+            if pwd_loc and pwd_loc.get_attribute("aria-invalid") == "true":
+                raise RuntimeError("密码页提示输入有误，请检查页面的校验提示")
+            if challenge.is_visible():
+                self._maybe_wait_challenge()
+                return True
+            detail = str(exc)
+            if ("intercepts pointer events" in detail and "click action done" not in detail
+                    and submit.is_visible() and submit.is_enabled()
+                    and not self.page.locator('[role="dialog"][aria-modal="true"]:visible').count()):
+                # An enabled submit can be covered by a presentation span.
+                # Activate the actual button with the keyboard; never strip a
+                # disabled attribute or bypass a visible verification dialog.
+                self._check_cancel()
+                self._log(f"{action} 已可用，但鼠标点击被页面元素遮挡；改用键盘 Enter 提交")
+                try:
+                    submit.press("Enter", timeout=5000, no_wait_after=True)
+                    self._log(f"已提交：{action}（键盘 Enter）；开始等待提交结果")
+                except PlaywrightTimeout:
+                    self._log("键盘提交结果待确认，先等待页面变化，暂不刷新")
+            else:
+                # A click may have been dispatched before navigation timed out.
+                self._log(action + " 点击结果待确认，先等待页面变化，暂不刷新：" + detail.splitlines()[0])
+        if is_login:
+            self._wait_password_result(submitted_url, action=action)
+        else:
+            self._wait_password_result(submitted_url)
+        return True
 
     def _handle_email_step(self) -> bool:
         candidates = [
@@ -292,7 +730,12 @@ class ShopifyBot:
             self._click_button(["Continue", "Verify", "Submit", "继续", "验证"])
             return True
         if self.config.getboolean("settings", "manual_verify_fallback", fallback=True):
-            input("请在 AdsPower 窗口中填写邮箱验证码并点继续，完成后回到这里按回车...")
+            answer = self._ask_user("请填写邮箱验证码，或在 AdsPower 窗口完成后继续...", kind="otp")
+            if answer.strip():
+                if not re.fullmatch(r"\d{6}", answer.strip()):
+                    raise RuntimeError("邮箱验证码应为 6 位数字")
+                self._fill_locator(box, answer.strip())
+                self._click_button(["Continue", "Verify", "Submit", "继续", "验证"])
             return True
         raise RuntimeError("获取邮箱验证码失败，且未开启手动验证。")
 
@@ -420,59 +863,78 @@ class ShopifyBot:
 
     def _ensure_admin(self):
         """已登录则进后台；未登录才走注册。"""
+        self._remember_admin()
         if self._looks_logged_in():
             self._log("当前已在 Shopify 后台，跳过注册，直接做后续设置。")
             return
-        saved = (self.data.get("店铺后台") or "").strip()
-        if "admin.shopify.com/store/" in saved:
-            self._log(f"打开已有后台：{saved}")
-            try:
-                self.page.goto(saved, wait_until="domcontentloaded", timeout=25000)
-                self._sleep(short=True)
-            except Exception as e:
-                self._log(f"打开已有后台失败：{e}")
-            if self._looks_logged_in():
+        saved = admin_store_base(self.data.get("店铺后台")) or admin_store_base(self.page.url)
+        if saved:
+            if admin_store_base(self.page.url) == saved:
+                self._log(f"沿用正在加载的后台：{saved}")
+            else:
+                self._log(f"打开已有后台：{saved}")
+                try:
+                    self.page.goto(saved, wait_until="commit", timeout=25000)
+                except Exception as e:
+                    self._log(f"打开已有后台失败：{e}")
+                    if browser_disconnected(e) or not retryable_browser_error(e):
+                        raise
+            if self._wait_for_admin():
                 return
-        try:
-            self.page.goto("https://admin.shopify.com", wait_until="domcontentloaded", timeout=25000)
-            self._sleep(short=True)
-        except Exception:
-            pass
-        if self._looks_logged_in():
-            self._log("已登录现有店铺，跳过注册。")
-            return
-
-        signup_url = self.config.get("settings", "shopify_signup_url")
-        self._log(f"未登录，开始注册：{signup_url}")
-        self._goto_signup(signup_url)
+            if admin_store_base(self.page.url) or browser_error_page(self.page.url):
+                raise PageLoadError("已有店铺后台刷新后仍未加载，等待自动恢复")
+            self._log("已有店铺需要登录，沿用已保存的账号密码继续")
+        else:
+            signup_url = self.config.get("settings", "shopify_signup_url",
+                                         fallback="https://accounts.shopify.com/signup")
+            self._log(f"打开 Shopify 注册入口：{signup_url}")
+            self._goto_signup(signup_url)
         self._sleep(short=True)
         self._maybe_wait_challenge()
         for step in range(20):
+            self._check_cancel()
             if self._looks_logged_in():
                 self._log("已进入 Shopify 后台。")
                 return
+            if admin_store_base(self.page.url):
+                if self._wait_for_admin():
+                    self._log("刷新后已进入 Shopify 后台。")
+                    return
+                raise PageLoadError("店铺后台刷新后仍未加载，等待自动恢复")
             acted = (
-                self._handle_skip_offer()
+                self._continue_from_account_profile()
+                or self._handle_account_selection()
+                or self._handle_store_selection()
+                or self._handle_skip_offer()
                 or self._handle_password_step()
                 or self._handle_otp_step()
                 or self._handle_email_step()
-                or self._handle_store_details_step()
-                or self._handle_shop_name_step()
-                or self._handle_survey()
-                or self._handle_profile_step()
+                or (not saved and (
+                    self._handle_store_details_step()
+                    or self._handle_shop_name_step()
+                    or self._handle_survey()
+                    or self._handle_profile_step()
+                ))
             )
             if not acted:
+                if saved:
+                    # Unknown existing-store screens require confirmation;
+                    # never fall into the generic new-account actions.
+                    break
                 self._click_button(["Continue", "Next", "Create account", "Skip", "继续"])
             self._sleep(short=True)
             self._maybe_wait_challenge()
             self._log(f"步骤 {step + 1}，当前地址：{self.page.url}")
         if self.config.getboolean("settings", "manual_verify_fallback", fallback=True):
-            input("页面尚未进入后台。请在 AdsPower 中登录或完成注册，进入后台后回到这里按回车...")
-        if not self._looks_logged_in():
-            raise RuntimeError(f"未能进入后台，停在：{self.page.url}")
+            self._ask_user("已有店铺后台尚未加载或需要确认，请在 AdsPower 中完成登录后继续..." if saved else
+                           "页面尚未进入后台，请在 AdsPower 中完成登录或注册后继续...")
+        if not self._wait_for_admin():
+            raise RuntimeError(f"未能进入{'已有店铺后台' if saved else '后台'}，停在：{self.page.url}")
 
     def _finish_with_setup(self):
         from store_setup import StoreSetup
+        if not self._looks_logged_in():
+            raise RuntimeError("尚未确认进入真实店铺后台，未执行资料和政策设置；请先完成登录或注册")
         self._log("开始店铺设置：资料 / 退货规则 / 书面政策（主题不做）...")
         setup_result = StoreSetup(self).run()
         notes = setup_result.get("setup_notes") or ""
@@ -493,37 +955,73 @@ class ShopifyBot:
             "admin_url": admin_url,
             "setup_notes": notes,
             "error": f"后续设置未完成：{notes}",
+            "retryable": setup_result.get("retryable", False),
         }
+
+    def _run_browser_attempt(self):
+        self._log("正在启动 AdsPower 环境...")
+        ws = self.ads.start(self.profile_id)
+        self._started_profile = True
+        self._log(f"环境已启动，CDP：{ws}")
+        with sync_playwright() as p:
+            try:
+                self.browser = p.chromium.connect_over_cdp(ws)
+                if not self.browser.contexts:
+                    raise PageLoadError("浏览器连接尚未就绪")
+                context = self.browser.contexts[0]
+                pages = [page for page in context.pages if not page.is_closed()]
+                saved = admin_store_base(self.data.get("店铺后台"))
+                candidates = [page for page in pages if admin_store_base(page.url) == saved] if saved else [
+                    page for page in pages if re.match(r"^https://(?:admin|accounts|www)\.shopify\.com/", page.url)
+                ]
+                if not candidates and saved:
+                    errors = [page for page in pages if browser_error_page(page.url)]
+                    if len(errors) == 1:
+                        candidates = errors
+                self.page = candidates[0] if candidates else context.new_page()
+                self.page.set_default_timeout(8000)
+                self._ensure_admin()
+                self.data["店铺后台"] = self.admin_url
+                return self._finish_with_setup()
+            except Exception:
+                try:
+                    if self.page and not self.page.is_closed():
+                        screenshot = f"error_{self.shop_name}_{time.strftime('%Y%m%d%H%M%S')}.png"
+                        self.page.screenshot(path=screenshot, timeout=5000)
+                        self._log(f"错误页面已截图：{screenshot}")
+                except Exception:
+                    pass
+                raise
 
     def register(self):
         self._log(f"\n=== 开始处理：邮箱={self.email}，店铺名={self.shop_name}，环境={self.profile_id} ===")
+        result = {}
+        recoveries = max(0, self.config.getint("settings", "browser_recovery_attempts", fallback=2))
         try:
-            self._log("正在启动 AdsPower 环境...")
-            ws = self.ads.start(self.profile_id)
-            self._started_profile = True
-            self._log(f"环境已启动，CDP：{ws}")
-
-            with sync_playwright() as p:
-                self.browser = p.chromium.connect_over_cdp(ws)
-                context = self.browser.contexts[0]
-                self.page = context.pages[0] if context.pages else context.new_page()
-                self.page.set_default_timeout(8000)
-                self._ensure_admin()
-                return self._finish_with_setup()
-
-        except Exception as e:
-            self._log(f"处理失败：{e}")
-            screenshot = f"error_{self.shop_name}_{time.strftime('%Y%m%d%H%M%S')}.png"
-            try:
-                if self.page:
-                    self.page.screenshot(path=screenshot)
-                    self._log(f"错误页面已截图：{screenshot}")
-            except Exception:
-                pass
-            return {"status": "failed", "shop_name": self.shop_name, "error": str(e), "password": self.password}
-
+            for attempt in range(recoveries + 1):
+                self._check_cancel()
+                try:
+                    result = self._run_browser_attempt()
+                except FirstPageUnavailable as exc:
+                    result = {"status": "failed", "shop_name": self.shop_name, "error": str(exc),
+                              "password": self.password, "retryable": False,
+                              "failure_code": "first_page_unavailable"}
+                except Exception as exc:
+                    result = {"status": "failed", "shop_name": self.shop_name, "error": str(exc),
+                              "password": self.password, "retryable": retryable_browser_error(exc)}
+                if result.get("status") == "success":
+                    return result
+                self._log("本次处理未完成：" + result.get("error", "未知错误"))
+                if not result.get("retryable") or attempt == recoveries:
+                    break
+                self._log(f"自动恢复（{attempt + 1}/{recoveries}）：重新连接原环境 {self.profile_id}，继续未完成步骤")
+                self._sleep()
+            if result.get("retryable") and recoveries:
+                self._log("自动恢复次数已用完，已保留任务进度")
+            return result
         finally:
-            if self.config.getboolean("settings", "close_browser_after", fallback=False) and self._started_profile:
+            if (result.get("status") == "success" and self._started_profile
+                    and self.config.getboolean("settings", "close_browser_after", fallback=False)):
                 self.ads.stop(self.profile_id)
             elif self._started_profile:
-                self._log("已按配置保持 AdsPower 窗口打开，便于你继续设置店铺。")
+                self._log("保留 AdsPower 环境和任务进度，未主动关闭窗口。")
